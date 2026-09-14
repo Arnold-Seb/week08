@@ -139,3 +139,4 @@ def health_check() -> dict[str, str]:
         "status": "healthy",
         "service": "user-service",
     }
+# SIT722 Task 8.1P: small change used to trigger the continuous delivery pipeline.
