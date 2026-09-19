@@ -140,3 +140,4 @@ def health_check() -> dict[str, str]:
         "service": "user-service",
     }
 # SIT722 Task 8.1P: small change used to trigger the continuous delivery pipeline.
+# Pipeline run 2: rebuilt infrastructure with Terraform (Week 06 approach), 3 AKS nodes.
