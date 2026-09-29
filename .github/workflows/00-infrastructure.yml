@@ -1,0 +1,70 @@
+name: 00 - Infrastructure
+
+# Infrastructure changes are rare and destructive, so this workflow is not
+# tied to a code push. A pull request that touches terraform/ gets a plan so
+# the change can be reviewed. Applying and destroying stay manual.
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Terraform action to run"
+        required: true
+        default: plan
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+
+  pull_request:
+    paths:
+      - "terraform/**"
+
+jobs:
+  terraform:
+    name: Terraform
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: terraform
+
+    # The azurerm provider reads these. They come from the same
+    # AZURE_CREDENTIALS secret the rest of the pipeline already uses,
+    # so no new secret was needed.
+    env:
+      ARM_CLIENT_ID: ${{ fromJSON(secrets.AZURE_CREDENTIALS).clientId }}
+      ARM_CLIENT_SECRET: ${{ fromJSON(secrets.AZURE_CREDENTIALS).clientSecret }}
+      ARM_SUBSCRIPTION_ID: ${{ fromJSON(secrets.AZURE_CREDENTIALS).subscriptionId }}
+      ARM_TENANT_ID: ${{ fromJSON(secrets.AZURE_CREDENTIALS).tenantId }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform init
+        run: terraform init
+
+      - name: Terraform validate
+        run: terraform validate
+
+      - name: Terraform plan
+        if: github.event_name == 'pull_request' || inputs.action != 'destroy'
+        run: terraform plan -no-color
+
+      - name: Terraform apply
+        if: github.event_name == 'workflow_dispatch' && inputs.action == 'apply'
+        run: terraform apply -auto-approve -no-color
+
+      - name: Terraform destroy
+        if: github.event_name == 'workflow_dispatch' && inputs.action == 'destroy'
+        run: terraform destroy -auto-approve -no-color
+
+      - name: Show outputs
+        if: github.event_name == 'workflow_dispatch' && inputs.action == 'apply'
+        run: terraform output
