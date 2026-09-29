@@ -24,7 +24,11 @@ RUN npm run build
 
 FROM nginx:1.30-alpine
 
-COPY nginx.conf /etc/nginx/conf.d/default.conf
+# Which nginx config to bake in. Defaults to the working one.
+# nginx.fault.conf is used only to demonstrate automatic rollback.
+ARG NGINX_CONF=nginx.conf
+
+COPY ${NGINX_CONF} /etc/nginx/conf.d/default.conf
 
 COPY --from=build /app/dist /usr/share/nginx/html
 

@@ -1,0 +1,105 @@
+# Blue/green pair for the frontend.
+#
+# Two complete Deployments exist at all times. They are identical apart from
+# the colour label. The Service selector decides which one receives traffic,
+# so a release is a change to one label selector rather than a restart of
+# anything. That is what makes the switch atomic and the rollback instant.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend-blue
+  namespace: production
+  labels:
+    app: frontend
+    colour: blue
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: frontend
+      colour: blue
+  template:
+    metadata:
+      labels:
+        app: frontend
+        colour: blue
+    spec:
+      containers:
+        - name: frontend
+          image: placeholder
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 80
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            failureThreshold: 3
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend-green
+  namespace: production
+  labels:
+    app: frontend
+    colour: green
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: frontend
+      colour: green
+  template:
+    metadata:
+      labels:
+        app: frontend
+        colour: green
+    spec:
+      containers:
+        - name: frontend
+          image: placeholder
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 80
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            failureThreshold: 3
+---
+# The live Service. Its selector is the release switch.
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: production
+spec:
+  type: LoadBalancer
+  selector:
+    app: frontend
+    colour: blue
+  ports:
+    - port: 80
+      targetPort: 80
+---
+# The preview Service. Points at whichever colour is idle, so the pipeline can
+# test a new version with real HTTP requests while no user can reach it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend-preview
+  namespace: production
+spec:
+  type: ClusterIP
+  selector:
+    app: frontend
+    colour: green
+  ports:
+    - port: 80
+      targetPort: 80

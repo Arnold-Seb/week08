@@ -1,0 +1,218 @@
+name: 06 - Blue/Green Deploy
+
+# Blue/green release with automatic rollback.
+#
+# Two complete copies of each stateless service run at all times, labelled blue
+# and green. The Service selector decides which copy receives traffic, so a
+# release is a single label change and a rollback is the same change reversed.
+#
+# There are three points at which a bad release is stopped:
+#   Gate 1  the new colour never becomes ready, so the rollout fails
+#   Gate 2  the new colour fails a smoke test while still on zero traffic
+#   Gate 3  the new colour is live but fails under real traffic during the
+#           bake window, and the workflow switches back without being asked
+#
+# Gate 3 is the interesting one. Everything before it is a check. Gate 3 is a
+# control loop: the pipeline observes the consequence of its own action and
+# reverses it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to release"
+        required: true
+        type: string
+      bake_seconds:
+        description: "Seconds to watch live traffic before accepting the release"
+        required: true
+        default: "60"
+        type: string
+      max_failure_percent:
+        description: "Failed-request percentage that triggers a rollback"
+        required: true
+        default: "2"
+        type: string
+
+jobs:
+  bluegreen:
+    name: Blue/Green Release
+    runs-on: ubuntu-latest
+
+    env:
+      NAMESPACE: production
+      # Services that participate. Adding the remaining four is a change to
+      # this list and nothing else.
+      SERVICES: "frontend user-service"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Login to Azure
+        uses: azure/login@v3
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get AKS credentials
+        run: |
+          az aks get-credentials \
+            --resource-group ${{ vars.AKS_RESOURCE_GROUP }} \
+            --name ${{ vars.AKS_CLUSTER_NAME }} \
+            --overwrite-existing
+
+      # The workflow has to know what is live before it changes anything, both
+      # to pick the idle colour and to have something to roll back to.
+      - name: Determine live and target colour
+        run: |
+          LIVE=$(kubectl get service frontend -n "$NAMESPACE" \
+            -o jsonpath='{.spec.selector.colour}')
+
+          if [ -z "$LIVE" ]; then
+            echo "The frontend Service has no colour selector."
+            echo "Run the bootstrap steps before using this workflow."
+            exit 1
+          fi
+
+          if [ "$LIVE" = "blue" ]; then TARGET=green; else TARGET=blue; fi
+
+          echo "Live colour   : $LIVE"
+          echo "Target colour : $TARGET"
+          echo "LIVE_COLOUR=$LIVE"     >> "$GITHUB_ENV"
+          echo "TARGET_COLOUR=$TARGET" >> "$GITHUB_ENV"
+
+      - name: Point preview services at the target colour
+        run: |
+          for SVC in $SERVICES; do
+            kubectl patch service "${SVC}-preview" -n "$NAMESPACE" \
+              -p "{\"spec\":{\"selector\":{\"app\":\"${SVC}\",\"colour\":\"${TARGET_COLOUR}\"}}}"
+          done
+
+      - name: Deploy the new image to the idle colour
+        run: |
+          for SVC in $SERVICES; do
+            kubectl set image "deployment/${SVC}-${TARGET_COLOUR}" \
+              "${SVC}=${{ vars.ACR_LOGIN_SERVER }}/koalatech-${SVC}:${{ inputs.image_tag }}" \
+              -n "$NAMESPACE"
+          done
+
+      # Gate 1. No traffic has moved yet, so a failure here costs nothing.
+      - name: Gate 1 - wait for the idle colour to become ready
+        run: |
+          for SVC in $SERVICES; do
+            kubectl rollout status "deployment/${SVC}-${TARGET_COLOUR}" \
+              -n "$NAMESPACE" --timeout=180s
+          done
+          kubectl get pods -n "$NAMESPACE" -l colour="$TARGET_COLOUR" -o wide
+
+      # Gate 2. Real HTTP requests against the new version while it is still
+      # unreachable by users, through the preview Service.
+      - name: Gate 2 - smoke test the idle colour on zero traffic
+        run: |
+          kubectl port-forward -n "$NAMESPACE" service/frontend-preview 8080:80 \
+            > /dev/null 2>&1 &
+          PF_PID=$!
+          sleep 6
+
+          echo "Readiness endpoint:"
+          curl --fail --silent --show-error --retry 3 --retry-delay 2 \
+            --max-time 5 http://127.0.0.1:8080/healthz
+          echo ""
+
+          echo "Application root:"
+          curl --fail --silent --show-error --retry 3 --retry-delay 2 \
+            --max-time 5 -o /dev/null -w 'HTTP %{http_code}\n' http://127.0.0.1:8080/
+
+          echo "Backend through the frontend proxy:"
+          curl --fail --silent --show-error --retry 3 --retry-delay 2 \
+            --max-time 5 http://127.0.0.1:8080/api/users/health
+          echo ""
+
+          kill $PF_PID || true
+
+      - name: Resolve the public address
+        run: |
+          IP=$(kubectl get service frontend -n "$NAMESPACE" \
+            -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          echo "Public IP: $IP"
+          echo "PUBLIC_IP=$IP" >> "$GITHUB_ENV"
+
+      # Started before the switch so the switch itself is measured, not just
+      # what happens afterwards.
+      - name: Start the continuous availability probe
+        run: |
+          chmod +x scripts/probe.sh scripts/probe-report.sh
+          nohup ./scripts/probe.sh "http://$PUBLIC_IP/" /tmp/probe.csv /tmp/probe.stop 0.2 \
+            > /dev/null 2>&1 &
+          echo $! > /tmp/probe.pid
+          sleep 3
+          echo "Probe running, $(wc -l < /tmp/probe.csv) requests recorded so far."
+
+      # The release itself. One label change per service, applied atomically by
+      # the API server. No pod is restarted and no container is rebuilt.
+      - name: Switch traffic to the new colour
+        run: |
+          for SVC in $SERVICES; do
+            kubectl patch service "$SVC" -n "$NAMESPACE" \
+              -p "{\"spec\":{\"selector\":{\"app\":\"${SVC}\",\"colour\":\"${TARGET_COLOUR}\"}}}"
+          done
+          echo "SWITCHED=true" >> "$GITHUB_ENV"
+          echo "Traffic now served by $TARGET_COLOUR."
+
+      - name: Bake
+        run: |
+          echo "Watching live traffic for ${{ inputs.bake_seconds }} seconds."
+          sleep ${{ inputs.bake_seconds }}
+
+      # Gate 3. This step failing is what triggers the rollback below.
+      - name: Gate 3 - judge the release on live traffic
+        run: |
+          touch /tmp/probe.stop
+          sleep 1
+          kill "$(cat /tmp/probe.pid)" 2>/dev/null || true
+          ./scripts/probe-report.sh /tmp/probe.csv ${{ inputs.max_failure_percent }}
+
+      # Nobody is asked. The workflow reverses its own change.
+      - name: Roll back
+        if: failure() && env.SWITCHED == 'true'
+        run: |
+          echo "Rolling traffic back to $LIVE_COLOUR."
+          for SVC in $SERVICES; do
+            kubectl patch service "$SVC" -n "$NAMESPACE" \
+              -p "{\"spec\":{\"selector\":{\"app\":\"${SVC}\",\"colour\":\"${LIVE_COLOUR}\"}}}"
+          done
+
+          NOW=$(kubectl get service frontend -n "$NAMESPACE" \
+            -o jsonpath='{.spec.selector.colour}')
+          echo "Frontend Service now selects: $NOW"
+
+          echo "Confirming the public address is healthy again:"
+          for i in 1 2 3 4 5; do
+            curl --silent --max-time 5 -o /dev/null \
+              -w "  attempt $i: HTTP %{http_code}\n" "http://$PUBLIC_IP/"
+            sleep 1
+          done
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Blue/Green Release"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Image tag | \`${{ inputs.image_tag }}\` |"
+            echo "| Colour before | \`$LIVE_COLOUR\` |"
+            echo "| Colour deployed | \`$TARGET_COLOUR\` |"
+            echo "| Colour now live | \`$(kubectl get service frontend -n "$NAMESPACE" -o jsonpath='{.spec.selector.colour}')\` |"
+            echo "| Bake window | ${{ inputs.bake_seconds }}s |"
+            echo "| Failure threshold | ${{ inputs.max_failure_percent }}% |"
+            echo ""
+            if [ -f /tmp/probe.csv ]; then
+              echo "### Measured availability across the switch"
+              echo ""
+              echo '```'
+              ./scripts/probe-report.sh /tmp/probe.csv 100 || true
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
