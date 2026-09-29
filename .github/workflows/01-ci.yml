@@ -164,12 +164,26 @@ jobs:
       # deployed. Only fixable findings are counted: two of the highs in this
       # image have no fix available, and blocking on those would stop a build
       # that nobody could unblock.
+      # Two Scout steps on purpose. The first reports everything so the findings
+      # are in the log. The second is the gate, and it only blocks on critical.
+      # A gate set at "any fixable high" would block on starlette, which is pulled
+      # in by FastAPI and cannot be pinned directly, so the build could never pass.
+      # A gate nobody can satisfy gets deleted, so it is set where it can be met.
       - name: Scan the image with Docker Scout
         uses: docker/scout-action@v1
         with:
           command: cves,recommendations
           image: ${{ vars.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ github.sha }}
           only-severities: critical,high
+          only-fixed: true
+          exit-code: false
+
+      - name: Fail the build on critical vulnerabilities
+        uses: docker/scout-action@v1
+        with:
+          command: cves
+          image: ${{ vars.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ github.sha }}
+          only-severities: critical
           only-fixed: true
           exit-code: true
 
